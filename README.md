@@ -68,7 +68,12 @@ const res = await fetch(`${API_BASE_URL}/api`, {
 
 Command: `REGISTER_AUTH_1A2` — no session required.
 
-Registration is always **JSON only**. Profile images and documents are uploaded **after** registration using dedicated upload commands.
+Registration is always **JSON only**. Registration creates **ONLY** the User account with `verificationStatus: "pending"` and sends a 6-digit verification code via email. 
+
+> **IMPORTANT ARCHITECTURAL RULE:**
+> User registration does **NOT** create a `DoctorProfile` or a `Facility`.
+> All profiles and facilities are created through separate dedicated operations **after** the user's email has been verified (`verificationStatus: "verified"`).
+> Combined registration payloads containing nested `doctor` or `facility` objects are not supported.
 
 `accountType` defaults to `PATIENT` when omitted.
 
@@ -81,19 +86,17 @@ Registration is always **JSON only**. Profile images and documents are uploaded 
 
 `ADMIN` and `INSPECTOR` are controlled roles and are rejected by public registration.
 
-### Common fields
+### Request fields
 
 | Field | Required | Description |
 | --- | --- | --- |
-| `accountType` | No | Public role. Defaults to `PATIENT`. |
+| `accountType` | No | Public role. One of: `PATIENT`, `DOCTOR`, `PHARMACY_ADMIN`, `CLINIC_ADMIN`. Defaults to `PATIENT`. |
 | `name` | Yes | Display name, max 150 characters. |
 | `email` | Yes | Valid email address. |
 | `phone` | Yes | Phone number, max 30 characters. |
 | `password` | Yes | At least 8 characters. |
-| `doctor` | Doctor only | Doctor profile object (see below). |
-| `facility` | Pharmacy / Clinic only | Facility object (see below). |
 
-### Patient registration
+### Registration example (all account types)
 
 ```json
 {
@@ -105,13 +108,25 @@ Registration is always **JSON only**. Profile images and documents are uploaded 
 }
 ```
 
-Patient accounts are immediately active.
+```json
+{
+  "accountType": "DOCTOR",
+  "name": "Dr. Example",
+  "email": "doctor@example.com",
+  "phone": "+15550000002",
+  "password": "ExamplePassword123!"
+}
+```
+
+### Registration response
+
+For all accounts, registration responds with `201 Created` and `verificationStatus: "pending"`:
 
 ```json
 {
   "success": true,
   "statusCode": 201,
-  "message": "Registration successful",
+  "message": "Registration successful. A 6-digit verification code has been sent to your email.",
   "data": {
     "user": {
       "id": "00000000-0000-4000-8000-000000000080",
@@ -121,114 +136,308 @@ Patient accounts are immediately active.
       "roleId": "00000000-0000-4000-8000-000000000081",
       "role": "PATIENT",
       "status": "active",
-      "accountStatus": "ACTIVE"
+      "accountStatus": "ACTIVE",
+      "verificationStatus": "pending"
+    },
+    "verificationStatus": "pending",
+    "requiresEmailVerification": true
+  }
+}
+```
+
+---
+
+## Email OTP Verification
+
+Command: `VERIFY_OTP_AUTH_7V8` — no session required (public).
+
+Users submit the 6-digit OTP received via email to verify their account.
+
+### Security and Lifecycle rules
+- OTP is exactly 6 numeric digits.
+- Generated cryptographically and hashed using SHA-256 before database storage.
+- Expires after **10 minutes**.
+- Single-use: once verified, the OTP hash and expiry are cleared immediately.
+- Upon successful verification, `verificationStatus` transitions from `"pending"` to `"verified"`.
+
+### Request
+
+```json
+{
+  "email": "doctor@example.com",
+  "otp": "481920"
+}
+```
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `email` | Yes | Email address of the registered user. |
+| `otp` | Yes | Exactly 6 numeric digits received via email. |
+
+### Response (200 OK)
+
+```json
+{
+  "success": true,
+  "statusCode": 200,
+  "message": "Email verified successfully",
+  "data": {
+    "user": {
+      "id": "00000000-0000-4000-8000-000000000080",
+      "name": "Dr. Example",
+      "email": "doctor@example.com",
+      "phone": "+15550000002",
+      "role": "DOCTOR",
+      "status": "active",
+      "accountStatus": "ACTIVE",
+      "verificationStatus": "verified"
+    },
+    "verificationStatus": "verified"
+  }
+}
+```
+
+If already verified:
+```json
+{
+  "success": true,
+  "statusCode": 200,
+  "message": "Email is already verified",
+  "data": {
+    "verificationStatus": "verified"
+  }
+}
+```
+
+---
+
+## Resend Verification OTP
+
+Command: `RESEND_OTP_AUTH_8R9` — no session required (public).
+
+Generates and emails a new 6-digit OTP, invalidating any previously issued OTP.
+
+### Security and Rate Limiting
+- **60-second cooldown**: A new OTP cannot be requested within 60 seconds of the previous send.
+- **Enumeration protection**: Responds with a generic success message regardless of whether the email is registered.
+
+### Request
+
+```json
+{
+  "email": "doctor@example.com"
+}
+```
+
+### Response (200 OK)
+
+```json
+{
+  "success": true,
+  "statusCode": 200,
+  "message": "If this account exists, a new verification code has been sent to the email address."
+}
+```
+
+---
+
+## Doctor Profile Creation (Unified Onboarding)
+
+Command: `DOC_PRF_CRT_D2A` — session required. **Request type: `multipart/form-data`**.
+
+Creates the `DoctorProfile`, uploads the doctor profile image, and uploads all mandatory doctor documents in a single atomic multipart operation.
+
+### Requirements:
+1. User must be authenticated (`sessionId` cookie).
+2. User account role must be `DOCTOR`.
+3. User must have `verificationStatus: "verified"`. (Rejects with `403 Forbidden` if pending).
+4. **Doctor profile image is mandatory**.
+5. **Mandatory doctor documents are required**:
+   - `MEDICAL_LICENSE`: Medical practicing license
+   - `NATIONAL_ID`: National identity card or passport
+   - `PROFESSIONAL_CERTIFICATE`: Primary professional medical qualification certificate
+6. Optional supporting documents may be included: `SPECIALTY_CERTIFICATE`, `TRAINING_CERTIFICATE`, `ACHIEVEMENT_CERTIFICATE`, `AWARD`, `OTHER`.
+7. `facilityId` is optional.
+
+### FormData Fields:
+
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| `licenseNumber` | string | Yes | Professional medical license number. |
+| `specialty` | string | No | Medical specialty (e.g., Cardiology, Pediatrics). |
+| `facilityId` | UUID | No | Associated facility UUID, if applicable. |
+| `image` (or `photo`) | File | Yes | Profile photo (.jpg, .png, .webp, max 10MB). |
+| `MEDICAL_LICENSE` (or `medicalLicense`) | File | Yes | Medical license document (.pdf, .jpg, .png, .webp, max 10MB). |
+| `NATIONAL_ID` (or `nationalId`) | File | Yes | National ID document (.pdf, .jpg, .png, .webp, max 10MB). |
+| `PROFESSIONAL_CERTIFICATE` (or `professionalCertificate`) | File | Yes | Professional certificate (.pdf, .jpg, .png, .webp, max 10MB). |
+
+### JavaScript Example:
+
+```ts
+const form = new FormData();
+form.append('licenseNumber', 'MD-12345');
+form.append('specialty', 'Cardiology');
+form.append('image', photoFile);
+form.append('MEDICAL_LICENSE', licenseFile);
+form.append('NATIONAL_ID', nationalIdFile);
+form.append('PROFESSIONAL_CERTIFICATE', certFile);
+
+const res = await fetch(`${API_BASE_URL}/api`, {
+  method: 'POST',
+  credentials: 'include',
+  headers: {
+    'X-Server-Key': gatewayKey,
+    'X-Command': 'DOC_PRF_CRT_D2A',
+  },
+  body: form,
+});
+```
+
+### Response (201 Created)
+
+```json
+{
+  "success": true,
+  "statusCode": 201,
+  "message": "Doctor profile and mandatory documents submitted successfully",
+  "data": {
+    "doctorProfile": {
+      "id": "00000000-0000-4000-8000-000000000030",
+      "userId": "00000000-0000-4000-8000-000000000080",
+      "licenseNumber": "MD-12345",
+      "specialty": "Cardiology",
+      "facilityId": null,
+      "imageUrl": "https://res.cloudinary.com/.../doctors/images/profile.webp",
+      "verificationStatus": "pending",
+      "documents": [
+        {
+          "id": "00000000-0000-4000-8000-000000000031",
+          "documentType": "MEDICAL_LICENSE",
+          "fileUrl": "https://res.cloudinary.com/.../doctors/documents/license.pdf",
+          "verificationStatus": "pending"
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000032",
+          "documentType": "NATIONAL_ID",
+          "fileUrl": "https://res.cloudinary.com/.../doctors/documents/id.pdf",
+          "verificationStatus": "pending"
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000033",
+          "documentType": "PROFESSIONAL_CERTIFICATE",
+          "fileUrl": "https://res.cloudinary.com/.../doctors/documents/cert.pdf",
+          "verificationStatus": "pending"
+        }
+      ]
     }
   }
 }
 ```
 
-### Doctor registration
+---
 
-Doctor fields inside `doctor`:
+## Facility Creation (Unified Onboarding)
 
-| Field | Required for completion | Description |
-| --- | --- | --- |
-| `licenseNumber` | Yes | Professional license number. |
-| `specialty` | Yes | Professional specialty. |
-| `facilityId` | No | Existing facility UUID, when applicable. |
+Creates a healthcare facility (Pharmacy or Clinic) owned by the authenticated user with its mandatory documents and optional image in one unified multipart command.
 
-```json
-{
-  "accountType": "DOCTOR",
-  "name": "Dr. Example",
-  "email": "doctor@example.com",
-  "phone": "+15550000002",
-  "password": "ExamplePassword123!",
-  "doctor": {
-    "licenseNumber": "MD-12345",
-    "specialty": "Cardiology",
-    "facilityId": "00000000-0000-4000-8000-000000000010"
-  }
-}
-```
+### Requirements:
+1. User must be authenticated (`sessionId` cookie).
+2. Role must be one of: `DOCTOR`, `CLINIC_ADMIN`, `PHARMACY_ADMIN`. (Rejects with `403 Forbidden` for other roles).
+3. User must have `verificationStatus: "verified"`. (Rejects with `403 Forbidden` if pending).
+4. **Mandatory facility documents are required**:
+   - `FACILITY_LICENSE`: Facility operating / registration license
+   - `RDB_CERTIFICATE`: Rwanda Development Board certificate or business registration
+   - `OWNER_ID`: National ID or passport of the facility owner/director
+5. **Automatic Pharmacy Capability**: If `facilityType` is `PHARMACY`, `pharmacyEnabled` is automatically set to `true`.
+6. Facility profile image is optional during onboarding.
+7. Subsequent image updates or document replacements can use `FAC_IMG_C3A` and `FAC_DOC_D3E`.
 
-The user is created with `status: "pending_verification"`. To add a profile photo or upload license documents, use the dedicated upload commands **after** login (see [Doctor File Uploads](#doctor-file-uploads)).
+### Commands:
+- **`FAC_CRT_F1A`**: Unified multipart facility onboarding (fields, optional image, mandatory documents).
+- **`FAC_IMG_C3A`**: Update facility profile image (multipart).
+- **`FAC_DOC_D3E`**: Upload additional/replacement facility document (multipart).
 
-If `doctor` is omitted, the user is created with `status: "incomplete"` and no profile is created.
+### Multipart Request (`FAC_CRT_F1A`)
 
-### Pharmacy admin registration
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| `name` | string | Yes | Official facility name. |
+| `facilityType` | string | Yes | One of: `PHARMACY`, `CLINIC`. |
+| `licenseNumber` | string | Yes | Facility operating license number. |
+| `address` | string | No | Physical street address. |
+| `pharmacyEnabled` | boolean | No | Whether pharmacy services are offered (automatically true for PHARMACY). |
+| `image` (or `photo`) | File | No | Facility photo (.jpg, .png, .webp, max 10MB). |
+| `FACILITY_LICENSE` (or `facilityLicense`) | File | Yes | Facility license document (.pdf, .jpg, .png, .webp, max 10MB). |
+| `RDB_CERTIFICATE` (or `rdbCertificate`) | File | Yes | RDB certificate (.pdf, .jpg, .png, .webp, max 10MB). |
+| `OWNER_ID` (or `ownerId`) | File | Yes | Owner national ID (.pdf, .jpg, .png, .webp, max 10MB). |
 
-Facility fields inside `facility`:
+### JavaScript Example:
 
-| Field | Required | Description |
-| --- | --- | --- |
-| `name` | Yes | Pharmacy name. |
-| `licenseNumber` | Yes | Pharmacy license number. |
-| `address` | Yes | Pharmacy address. |
-| `pharmacyEnabled` | No | Defaults to `true` for pharmacy admins. |
+```ts
+const form = new FormData();
+form.append('name', 'Downtown Pharmacy');
+form.append('facilityType', 'PHARMACY');
+form.append('licenseNumber', 'PH-987654');
+form.append('address', '145 Main Street');
+form.append('image', facilityPhoto);
+form.append('FACILITY_LICENSE', licenseFile);
+form.append('RDB_CERTIFICATE', rdbFile);
+form.append('OWNER_ID', ownerIdFile);
 
-```json
-{
-  "accountType": "PHARMACY_ADMIN",
-  "name": "Example Pharmacy Admin",
-  "email": "pharmacy-admin@example.com",
-  "phone": "+15550000003",
-  "password": "ExamplePassword123!",
-  "facility": {
-    "name": "Downtown Pharmacy",
-    "licenseNumber": "PH-987654",
-    "address": "145 Main Street",
-    "pharmacyEnabled": true
-  }
-}
-```
-
-Response (role-specific portion):
-
-```json
-{
-  "user": {
-    "id": "00000000-0000-4000-8000-000000000080",
-    "role": "PHARMACY_ADMIN",
-    "status": "pending_verification",
-    "accountStatus": "PENDING_VERIFICATION"
+const res = await fetch(`${API_BASE_URL}/api`, {
+  method: 'POST',
+  credentials: 'include',
+  headers: {
+    'X-Server-Key': gatewayKey,
+    'X-Command': 'FAC_CRT_F1A',
   },
-  "facility": {
-    "id": "00000000-0000-4000-8000-000000000010",
-    "ownerUserId": "00000000-0000-4000-8000-000000000080",
-    "name": "Downtown Pharmacy",
-    "facilityType": "PHARMACY",
-    "pharmacyEnabled": true,
-    "licenseNumber": "PH-987654",
-    "address": "145 Main Street",
-    "verificationStatus": "pending"
-  }
-}
+  body: form,
+});
 ```
 
-If `facility` is omitted, the user is created with `status: "incomplete"` and no facility is created.
-
-To upload facility license documents after registration, use `FAC_DOC_D3E` (see [Facility File Uploads](#facility-file-uploads)).
-
-### Clinic admin registration
+### Response (201 Created)
 
 ```json
 {
-  "accountType": "CLINIC_ADMIN",
-  "name": "Example Clinic Admin",
-  "email": "clinic-admin@example.com",
-  "phone": "+15550000004",
-  "password": "ExamplePassword123!",
-  "facility": {
-    "name": "Downtown Medical Clinic",
-    "licenseNumber": "CL-123456",
-    "address": "20 Health Avenue",
-    "pharmacyEnabled": false
+  "success": true,
+  "statusCode": 201,
+  "message": "Facility and mandatory documents submitted successfully",
+  "data": {
+    "facility": {
+      "id": "00000000-0000-4000-8000-000000000010",
+      "ownerUserId": "00000000-0000-4000-8000-000000000080",
+      "name": "Downtown Pharmacy",
+      "facilityType": "PHARMACY",
+      "pharmacyEnabled": true,
+      "licenseNumber": "PH-987654",
+      "address": "145 Main Street",
+      "imageUrl": "https://res.cloudinary.com/.../facilities/images/photo.webp",
+      "verificationStatus": "pending",
+      "createdAt": "2026-09-18T16:00:00.000Z",
+      "documents": [
+        {
+          "id": "00000000-0000-4000-8000-000000000011",
+          "documentType": "FACILITY_LICENSE",
+          "fileUrl": "https://res.cloudinary.com/.../facilities/documents/fac_license.pdf",
+          "verificationStatus": "pending"
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000012",
+          "documentType": "RDB_CERTIFICATE",
+          "fileUrl": "https://res.cloudinary.com/.../facilities/documents/rdb.pdf",
+          "verificationStatus": "pending"
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000013",
+          "documentType": "OWNER_ID",
+          "fileUrl": "https://res.cloudinary.com/.../facilities/documents/owner_id.pdf",
+          "verificationStatus": "pending"
+        }
+      ]
+    }
   }
 }
 ```
-
-Regulatory creates the facility with `facilityType: "CLINIC"`. `pharmacyEnabled` defaults to `false` when omitted.
 
 ---
 
@@ -1281,10 +1490,14 @@ Every command uses `POST /api` with `X-Server-Key` and `X-Command`. The **Type**
 
 | Command | Session | Type | Description |
 | --- | --- | --- | --- |
-| `REGISTER_AUTH_1A2` | No | JSON | Register a new user account. |
-| `LOGIN_AUTH_3B4` | No | JSON | Login; sets session cookie. |
-| `COMPLETE_REGISTRATION_AUTH_7M3` | Yes | JSON | Complete an incomplete account. |
+| `REGISTER_AUTH_1A2` | No | JSON | Register a new user account (returns verificationStatus: pending, sends OTP). |
+| `VERIFY_OTP_AUTH_7V8` | No | JSON | Verify account email with 6-digit OTP code. |
+| `RESEND_OTP_AUTH_8R9` | No | JSON | Resend 6-digit email OTP (60s cooldown). |
+| `LOGIN_AUTH_3B4` | No | JSON | Login; sets session cookie. Pending users can login. |
+| `COMPLETE_REGISTRATION_AUTH_7M3` | Yes | JSON | Complete an incomplete account (requires email verification). |
 | `LOGOUT_AUTH_5C6` | Yes | JSON | Destroy session. |
+| `DOC_PRF_CRT_D2A` | Yes (Doctor) | **multipart** | Unified doctor onboarding (profile data, mandatory photo, mandatory documents). |
+| `FAC_CRT_F1A` | Yes (Doctor/Clinic/Pharmacy Admin) | **multipart** | Unified facility onboarding (facility data, optional photo, mandatory documents). |
 | `DOC_IMG_D1B` | Yes | **multipart** | Upload doctor profile image. |
 | `DCT_DOC_D4F` | Yes | **multipart** | Upload doctor professional document. |
 | `DOC_LST_D5G` | Yes (Inspector) | JSON | List pending doctor documents for review. |
@@ -1292,7 +1505,7 @@ Every command uses `POST /api` with `X-Server-Key` and `X-Command`. The **Type**
 | `DOC_ACT_LST_D7J` | Yes (Inspector) | JSON | List pending doctor accounts & profiles. |
 | `DOC_ACT_REV_D8K` | Yes (Inspector) | JSON | Approve or reject a doctor account. |
 | `DOC_PRF_G9M` | Yes | JSON | Get doctor profile and uploaded documents. |
-| `FAC_IMG_C3A` | Yes | **multipart** | Upload facility profile image (after registration). |
+| `FAC_IMG_C3A` | Yes (Doctor/Clinic/Pharmacy Admin) | **multipart** | Create/update facility with image (requires verified email). |
 | `FAC_DOC_D3E` | Yes | **multipart** | Upload facility license / regulatory document. |
 | `FAC_DOC_LST_F8H` | Yes (Inspector) | JSON | List pending facility documents for review. |
 | `FAC_DOC_REV_F9I` | Yes (Inspector) | JSON | Approve or reject a facility document. |
