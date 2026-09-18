@@ -82,11 +82,39 @@ Content-Type: application/json
 }
 ```
 
-Expected: `201`, `accountStatus: "ACTIVE"`.
+Expected: `201`, `verificationStatus: "pending"`, 6-digit OTP emailed to user.
 
 ---
 
-**Step 2 — Login**
+**Step 2 — Verify Email OTP**
+
+```http
+POST /api
+X-Command: VERIFY_OTP_AUTH_7V8
+Content-Type: application/json
+
+{
+  "email": "patient@test.com",
+  "otp": "<6-digit OTP>"
+}
+```
+
+Expected: `200`, `verificationStatus: "verified"`.
+
+*(Optional) Resend OTP if needed:*
+```http
+POST /api
+X-Command: RESEND_OTP_AUTH_8R9
+Content-Type: application/json
+
+{
+  "email": "patient@test.com"
+}
+```
+
+---
+
+**Step 3 — Login**
 
 ```http
 POST /api
@@ -103,7 +131,7 @@ Expected: `200`, `authenticated: true`. Browser/Postman stores `sessionId` cooki
 
 ---
 
-**Step 3 — Logout**
+**Step 4 — Logout**
 
 ```http
 POST /api
@@ -117,9 +145,11 @@ Expected: `200`, `"Logout successful"`.
 
 ---
 
-## Flow 2 — Doctor Registration + Image + Document Upload
+## Flow 2 — Doctor Registration + Email OTP + Profile + Document Upload
 
-**Step 1 — Register Doctor**
+> **Important Rule:** User registration creates ONLY the user account. The Doctor Profile must be created in a separate step after email verification (`verificationStatus: "verified"`).
+
+**Step 1 — Register Doctor Account**
 
 ```http
 POST /api
@@ -131,19 +161,32 @@ Content-Type: application/json
   "name": "Dr. Test",
   "email": "doctor@test.com",
   "phone": "+254700000002",
-  "password": "Test1234!",
-  "doctor": {
-    "licenseNumber": "MD-99001",
-    "specialty": "Cardiology"
-  }
+  "password": "Test1234!"
 }
 ```
 
-Expected: `201`, `accountStatus: "PENDING_VERIFICATION"`.
+Expected: `201`, `verificationStatus: "pending"`. OTP sent to `doctor@test.com`.
 
 ---
 
-**Step 2 — Login as Doctor**
+**Step 2 — Verify Doctor Email OTP**
+
+```http
+POST /api
+X-Command: VERIFY_OTP_AUTH_7V8
+Content-Type: application/json
+
+{
+  "email": "doctor@test.com",
+  "otp": "<6-digit OTP>"
+}
+```
+
+Expected: `200`, `verificationStatus: "verified"`.
+
+---
+
+**Step 3 — Login as Doctor**
 
 ```http
 POST /api
@@ -160,65 +203,44 @@ Expected: `200`, session cookie set.
 
 ---
 
-**Step 3 — Upload Doctor Profile Image** *(multipart — no Content-Type header)*
+**Step 4 — Unified Doctor Onboarding (Profile + Mandatory Image + Mandatory Documents)**
+
+> Command: `DOC_PRF_CRT_D2A`
+> Request type: `multipart/form-data`
+> [session cookie required]
 
 ```
 POST /api
-X-Command: DOC_IMG_D1B
+X-Command: DOC_PRF_CRT_D2A
 [session cookie required]
 
 FormData:
-  file  →  any .jpg / .png / .webp image (max 10 MB)
+  licenseNumber            →  MD-99001
+  specialty                →  Cardiology
+  image                    →  photo.jpg (mandatory)
+  MEDICAL_LICENSE          →  license.pdf (mandatory)
+  NATIONAL_ID              →  national_id.pdf (mandatory)
+  PROFESSIONAL_CERTIFICATE →  certificate.pdf (mandatory)
 ```
 
 Curl example:
 ```bash
 curl -X POST http://localhost:3000/api \
   -H "X-Server-Key: development-gateway-key" \
-  -H "X-Command: DOC_IMG_D1B" \
+  -H "X-Command: DOC_PRF_CRT_D2A" \
   -b "sessionId=<your-session-id>" \
-  -F "file=@/path/to/photo.jpg"
+  -F "licenseNumber=MD-99001" \
+  -F "specialty=Cardiology" \
+  -F "image=@/path/to/photo.jpg" \
+  -F "MEDICAL_LICENSE=@/path/to/license.pdf" \
+  -F "NATIONAL_ID=@/path/to/id.pdf" \
+  -F "PROFESSIONAL_CERTIFICATE=@/path/to/cert.pdf"
 ```
 
-Expected: `200`, `data.profileImageUrl` is a Cloudinary URL.
+Expected: `201`, `data.doctorProfile.verificationStatus: "pending"` with uploaded `data.doctorProfile.documents` array in `pending` status.
 
----
+*(Note: `DOC_IMG_D1B` and `DCT_DOC_D4F` remain available for subsequent image updates or uploading/replacing individual supporting documents).*
 
-**Step 4 — Upload Doctor License Document** *(multipart)*
-
-```
-POST /api
-X-Command: DCT_DOC_D4F
-[session cookie required]
-
-FormData:
-  file          →  any .pdf / .jpg / .png / .webp (max 10 MB)
-  documentType  →  LICENSE
-```
-
-Curl example:
-```bash
-curl -X POST http://localhost:3000/api \
-  -H "X-Server-Key: development-gateway-key" \
-  -H "X-Command: DCT_DOC_D4F" \
-  -b "sessionId=<your-session-id>" \
-  -F "file=@/path/to/license.pdf" \
-  -F "documentType=LICENSE"
-```
-
-Expected: `201`, `data.document.status: "pending"`.
-
----
-
-**Step 5 — Upload Additional Certificate** *(same command, different type)*
-
-```
-FormData:
-  file          →  certificate.pdf
-  documentType  →  CERTIFICATE
-```
-
-Expected: `201`, another document record with `status: "pending"`.
 
 ---
 
@@ -329,7 +351,9 @@ Expected: `200`, `user.status: "active"` and `doctor.verificationStatus: "approv
 
 ---
 
-## Flow 3 — Pharmacy Registration + Facility Document Upload
+## Flow 3 — Pharmacy Registration + Email OTP + Facility Creation + Document Upload
+
+> **Important Rule:** User registration creates ONLY the user account. The Facility must be created in a separate step after email verification (`verificationStatus: "verified"`).
 
 **Step 1 — Register Pharmacy Admin**
 
@@ -343,21 +367,32 @@ Content-Type: application/json
   "name": "Test Pharmacy Admin",
   "email": "pharmacy@test.com",
   "phone": "+254700000003",
-  "password": "Test1234!",
-  "facility": {
-    "name": "Test Pharmacy",
-    "licenseNumber": "PH-77001",
-    "address": "10 Test Avenue",
-    "pharmacyEnabled": true
-  }
+  "password": "Test1234!"
 }
 ```
 
-Expected: `201`, `data.facility.verificationStatus: "pending"`. Save `data.facility.id` as **facilityId**.
+Expected: `201`, `verificationStatus: "pending"`. OTP emailed to `pharmacy@test.com`.
 
 ---
 
-**Step 2 — Login as Pharmacy Admin**
+**Step 2 — Verify Pharmacy Admin Email OTP**
+
+```http
+POST /api
+X-Command: VERIFY_OTP_AUTH_7V8
+Content-Type: application/json
+
+{
+  "email": "pharmacy@test.com",
+  "otp": "<6-digit OTP>"
+}
+```
+
+Expected: `200`, `verificationStatus: "verified"`.
+
+---
+
+**Step 3 — Login as Pharmacy Admin**
 
 ```http
 POST /api
@@ -369,6 +404,53 @@ Content-Type: application/json
   "password": "Test1234!"
 }
 ```
+
+Expected: `200`, session cookie set.
+
+---
+
+**Step 4 — Unified Facility Onboarding (Facility + Optional Image + Mandatory Documents)**
+
+> Command: `FAC_CRT_F1A`
+> Request type: `multipart/form-data`
+> Requires authenticated session and `verificationStatus: "verified"`.
+> Role: `DOCTOR`, `CLINIC_ADMIN`, or `PHARMACY_ADMIN`.
+
+```
+POST /api
+X-Command: FAC_CRT_F1A
+[session cookie required]
+
+FormData:
+  name             →  Test Pharmacy
+  facilityType     →  PHARMACY
+  licenseNumber    →  PH-77001
+  address          →  10 Test Avenue
+  image            →  pharmacy-photo.jpg (optional)
+  FACILITY_LICENSE →  fac_license.pdf (mandatory)
+  RDB_CERTIFICATE  →  rdb_cert.pdf (mandatory)
+  OWNER_ID         →  owner_id.pdf (mandatory)
+```
+
+Curl example:
+```bash
+curl -X POST http://localhost:3000/api \
+  -H "X-Server-Key: development-gateway-key" \
+  -H "X-Command: FAC_CRT_F1A" \
+  -b "sessionId=<your-session-id>" \
+  -F "name=Test Pharmacy" \
+  -F "facilityType=PHARMACY" \
+  -F "licenseNumber=PH-77001" \
+  -F "address=10 Test Avenue" \
+  -F "image=@/path/to/pharmacy-photo.jpg" \
+  -F "FACILITY_LICENSE=@/path/to/fac_license.pdf" \
+  -F "RDB_CERTIFICATE=@/path/to/rdb_cert.pdf" \
+  -F "OWNER_ID=@/path/to/owner_id.pdf"
+```
+
+Expected: `201`, `data.facility.verificationStatus: "pending"`, `pharmacyEnabled: true` (automatically enabled for PHARMACY), with uploaded documents array in `pending` status. Save `data.facility.id` as **facilityId**.
+
+*(Note: `FAC_IMG_C3A` and `FAC_DOC_D3E` remain available for updating facility image or uploading/replacing individual documents later).*
 
 ---
 
